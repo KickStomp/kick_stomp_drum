@@ -1,4 +1,4 @@
-/*  Example playing noise, colored noise tuneable
+/*  Example playing noise, colored noise tuneable, adding some filters
     using Mozzi sonification library.
 
     This sketch using HIFI mode on AVR (i.e. the classic Arduino borads, not Teensy 3.x and friends).
@@ -40,12 +40,71 @@
 */
 
 #include <MozziGuts.h>
+#include <Oscil.h> // oscillator template
+#include <EventDelay.h> // for scheduling events
+#include <ADSR.h> // ADSR envelope
+
+#include <tables/sin512_int8.h> // sine wavetable for oscillator, length 512 is normally sufficient
+// some more wavetables
+#include <tables/square_analogue512_int8.h>
+#include <tables/square_no_alias512_int8.h>
+#include <tables/saw_analogue512_int8.h>
+#include <tables/triangle_analogue512_int8.h>
+#include <tables/triangle512_int8.h>
+
+// rate (repetitions / second) of function updateControl()
+#define CONTROL_RATE 64
+
+// digitalReadFast
+// Standard Arduino Pins
+#define digitalPinToPINReg(P) \
+(((P) >= 0 && (P) <= 7) ? &PIND : (((P) >= 8 && (P) <= 13) ? &PINB : &PINC))
+#define digitalPinToBit(P) \
+(((P) >= 0 && (P) <= 7) ? (P) : (((P) >= 8 && (P) <= 13) ? (P) - 8 : (P) - 14))
+
+#define digitalReadFast(P) bitRead(*digitalPinToPINReg(P), digitalPinToBit(P))
+
+Oscil <512, AUDIO_RATE> kickOscil; // oscillator for kickdrum, fixed length of 512 for easy wavetable switching
+ADSR <AUDIO_RATE, AUDIO_RATE> kick_wave_envelope; // envelope for kickdrum
+
+// for triggering the envelope
+EventDelay noteDelay;
+ 
+// definition of used analog ports, adjust according to your setup
+uint8_t analog_input_port[]  = {A4, A5, A6, A7, A3};
+// BPM, Pattern, Randomness / Trigger-Level, Instrument, Piezo
+
+// digital-ports (switches)
+uint8_t digital_input_port[]  = {4, 2, 3};
+// Metronome, Shuffle, Fill
 
 uint8_t noise_color = 0;
+uint8_t switch1_state = 0;
+uint8_t switch2_state = 0;
+uint8_t switch3_state = 0;
+uint8_t fs1 = 0;
+uint8_t fs2 = 0;
+
+int16_t LP=0, HP=0, BP=0;
 
 void setup(){
   Serial.begin(115200);
   startMozzi(); // uses the default control rate of 64, defined in mozzi_config.h
+    noteDelay.set(2000); // 2 second countdown
+
+  kickOscil.setFreq(52); // set the frequency
+
+  // setup digital ports with internal pullup
+  pinMode(digital_input_port[0],INPUT_PULLUP);
+  pinMode(digital_input_port[1],INPUT_PULLUP);
+  pinMode(digital_input_port[2],INPUT_PULLUP);
+
+      // set the envelopes : timing & levels
+      
+    kick_wave_envelope.setTimes(10, 10, 20, 40);
+                                 
+    kick_wave_envelope.setLevels(255, 128, 32, 0);
+
 
 }
 
@@ -128,27 +187,183 @@ static uint8_t scount = 8;
         }
        
         if(noise){
-          return (127);
+          return (50);
         }
         else{
-          return(-127);
+          return(-50);
         }
 }
 
-void updateControl(){
-  static uint16_t i=10;
 
+// some fast filters as shift filters
+// based on https://www.edn.com/a-simple-software-lowpass-filter-suits-embedded-system-applications/
+// filter_shift 1..7 sets frequency
+int8_t Lowpass(int8_t filter_input, uint8_t filter_shift) {
+static int16_t filter_reg = 0; // Delay element – 16 bits
   
-    if(i){
-      i--;
+  // Update filter with current sample.
+  filter_reg = filter_reg - (filter_reg >> filter_shift) + filter_input ;  // sum = sum - filter_out + filter_in;
+  
+  // Scale output for unity gain.
+  return (int8_t)(filter_reg >> filter_shift);
+}
+
+// filter_shift 1..7 sets frequency
+int8_t Highpass(int8_t filter_input, uint8_t filter_shift) {
+static int16_t filter_reg = 0; // Delay element – 16 bits
+
+  // Update filter with current sample.
+  filter_reg = filter_reg - (filter_reg >> filter_shift) + filter_input;
+  
+  // Scale output for unity gain. (Highpass = input-Lowpass)
+  return (int8_t)(filter_input - (int8_t)(filter_reg >> filter_shift));
+}
+
+// filter_shift1 0..8 increasing cornerfrequency
+// filter_shift2 0..8 increasing feedback
+int16_t LowpassReso(int8_t filter_input, uint8_t filter_shift1, uint8_t filter_shift2) {
+static int16_t filter1 = 0; // Delay element – 16 bits
+static int16_t filter2 = 0; // Delay element – 16 bits
+
+  // Update filter with current sample.
+  filter1 = filter1 + (( (((int16_t)((int8_t)filter_input)) << 8) - filter2) >> filter_shift1) ;
+  filter2 = filter2 + ((filter1-filter2) >> filter_shift2);
+   
+  return (int8_t)(filter2 >> 8);
+}
+
+int16_t HighpassReso(int8_t filter_input, uint8_t filter_shift1, uint8_t filter_shift2) {
+static int16_t filter1 = 0; // Delay element – 16 bits
+static int16_t filter2 = 0; // Delay element – 16 bits
+
+  // Update filter with current sample.
+  filter1 = filter1 + (( (((int16_t)((int8_t)filter_input)) << 8) - filter2) >> filter_shift1) ;
+  filter2 = filter2 + ((filter1-filter2) >> filter_shift2);
+  
+  // (Highpass = input-Lowpass)
+  return (filter_input -(int8_t)(filter2 >> 8));
+}
+
+// https://tudl1086.home.xs4all.nl/synthcirc/filtsoftw/index-filtsoftw.htm
+// filter_f : frequency of filter 0..7 (decreasing frequency)
+// filter_q : resonance of filter 0..7 (increasing resonance) 
+int8_t SVF(int8_t filter_input, uint8_t filter_f, uint8_t filter_q) {
+  LP = LP + (BP >> filter_f);
+  HP = (((int16_t)((int8_t)filter_input)) << 8) - LP - (BP >> filter_q);
+  BP = BP + (HP >> filter_f);
+  
+  return (int8_t)(LP >> 8);
+}
+
+void updateControl(){
+  uint16_t analog_input;
+
+  uint8_t digital_input;
+  static uint8_t switch1_mode = 0;
+  static uint8_t switch2_mode = 0;
+  static uint8_t switch3_mode = 0;
+  static uint8_t wave_table = 0;
+
+
+    // read digital port of the 1st switch (noise algorithm) switch1_state : 0 = rnd / 1 = rnd_1bit / 2 = pink / 3 = colored / 4 = wav
+    digital_input = digitalReadFast(digital_input_port[0]);
+
+    if(switch1_mode != digital_input){
+       switch1_mode = digital_input;
+       switch1_state++;
+       if(switch1_state > 4){
+         switch1_state = 0;
+       }
+       Serial.print("S1 "); Serial.println(switch1_state);
     }
-    else{
-      i = (mozziAnalogRead(A4)>>2 ); 
-      // scroll through different noise_color values, rate depending on poti setting
-      noise_color++;
-      Serial.println(noise_color);
+
+    // read digital port of the 2nd switch (filter algorithm) switch2_state : 0 = no / 1 = LP / 2 = HP / 3 = LPreso / 4 = HPreso / 5 = SVF
+    digital_input = digitalReadFast(digital_input_port[1]);
+
+    if(switch2_mode != digital_input){
+       switch2_mode = digital_input;
+       switch2_state++;
+       if(switch2_state > 5){
+         switch2_state = 0;
+       }
+       Serial.print("  S2 "); Serial.println(switch2_state);
+    }
+
+    // read digital port of the 3rd switch (filter algorithm) switch3_state : 0 = no / 1 = envelope 
+    digital_input = digitalReadFast(digital_input_port[2]);
+
+    if(switch3_mode != digital_input){
+       switch3_mode = digital_input;
+       switch3_state++;
+       if(switch3_state > 1){
+         switch3_state = 0;
+       }
+       Serial.print("  S3 "); Serial.println(switch3_state);
     }
     
+    // noise_color 0..255
+    analog_input = (mozziAnalogRead(analog_input_port[0]) >> 2); 
+      // settings have changed
+      if( analog_input != noise_color){
+        noise_color = analog_input;
+        Serial.print("    ncolor "); Serial.println(noise_color);
+      }
+
+    // fs1 0..8
+    analog_input = (mozziAnalogRead(analog_input_port[1]) >> 7); 
+      // settings have changed
+      if( analog_input != fs1){
+        fs1 = analog_input;
+        Serial.print("      fs1 "); Serial.println(fs1);
+      }
+
+    // fs2 0..8
+    analog_input = (mozziAnalogRead(analog_input_port[2]) >> 7); 
+      // settings have changed
+      if( analog_input != fs2){
+        fs2 = analog_input;
+        Serial.print("        fs2 "); Serial.println(fs2);
+      }
+
+    // wave_table 0..5
+    analog_input = (mozziAnalogRead(analog_input_port[3]) >> 7); 
+     // set the wavetables
+    if( analog_input != wave_table){
+        wave_table = analog_input;
+        Serial.print("        wav "); Serial.println(wave_table);
+
+     
+         switch (wave_table) {
+           case 1:
+             kickOscil.setTable(SQUARE_ANALOGUE512_DATA);
+             break;
+           case 2:
+             kickOscil.setTable(SQUARE_NO_ALIAS512_DATA);
+             break;
+           case 3:
+             kickOscil.setTable(SAW_ANALOGUE512_DATA);
+             break;
+           case 4:
+             kickOscil.setTable(TRIANGLE_ANALOGUE512_DATA);
+             break;
+           case 5:
+             kickOscil.setTable(TRIANGLE512_DATA);
+             break;
+           default:
+             kickOscil.setTable(SIN512_DATA);
+             break;
+          }
+    }
+    if(switch3_state == 0){
+         // periodic start of kick-envelope
+     if(noteDelay.ready()){
+        // start event
+        noteDelay.start(750);
+
+        // start the kick envelope
+        kick_wave_envelope.noteOn();
+     }
+    }
   }
 
 
@@ -157,9 +372,67 @@ static uint8_t audio_count = 8;
 int16_t new_audio;
 int8_t noise;
 
-  noise = Rnd_color(noise_color);
-  
-  new_audio = ((int16_t)((int8_t)noise) << 6);  // scale up to 14 bit +-8192 (hifimode)
+  // update kick drum envelope
+  kick_wave_envelope.update();
+
+// switch1_state : 0 = rnd / 1 = rnd_1bit / 2 = pink / 3 = colored / 4 = wav
+switch (switch1_state) {
+  case 0:
+    noise = Rnd()>>1;
+    break;
+  case 1:
+    noise = Rnd(); 
+    if(noise & 0b00000001) {noise = 50;} else{noise = -50;}
+    break;
+  case 2:
+    noise = Rnd_pink()>>1;
+    break;
+  case 3:
+    noise = Rnd_color(noise_color);
+    break;
+  default:
+    noise = (kickOscil.next()>>1);
+
+}
+
+// switch2_state : 0 = no / 1 = LP / 2 = HP / 3 = LPreso / 4 = HPreso
+switch (switch2_state) {
+  case 1:
+    noise = Lowpass(noise, fs1);
+    break;
+  case 2:
+    noise = Highpass(noise, fs1);
+    break;
+  case 3:
+    noise = LowpassReso(noise, fs1, fs2);
+    break;
+  case 4:
+    noise = HighpassReso(noise, fs1, fs2);
+    break;
+  case 5:
+    noise = SVF(noise, fs1, fs2);
+    break;
+  default:
+    break;
+}
+
+// read digital port of the 3rd switch (filter algorithm) switch3_state : 0 = no / 1 = envelope 
+switch (switch3_state) {
+  case 1:
+    // mixing all oscillators & envelopes
+    new_audio = (int16_t)   ( ((int16_t)(int8_t)(noise))    << 6      ) ;                                              // scale upt to signed 14 bit +-8192 (hifimode)
+ 
+      break;
+  default:
+   new_audio = (int16_t) (
+    ((
+       ( (int16_t)(uint8_t)kick_wave_envelope.next() * (int16_t)(int8_t)noise  ) 
+                                                             // 255 * 128 = 32640 == > / 4
+      ) >> 2 )                                                 // scale down to signed 14 bit +-8192 (hifimode)
+     );
+    break;
+}
+
 
 /*
  if(!audio_count)
